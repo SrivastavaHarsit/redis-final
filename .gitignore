@@ -1,0 +1,38 @@
+# Compiled object files
+*.o
+
+# Compiled binary executables
+db
+hariya_server
+hariya_client
+
+# Backup files
+*~
+*.bak
+
+# Editor/IDE files
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build directories
+build/
+cmake-build-*/
+
+# Data and WAL files
+data/
+*.wal
+
+# Logs
+*.log
+
+# Core dumps
+core
+core.*
+
+# Ignore generated files
+*.out
