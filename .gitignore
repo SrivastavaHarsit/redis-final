@@ -36,3 +36,6 @@ core.*
 
 # Ignore generated files
 *.out
+test.cpp
+server
+cclient

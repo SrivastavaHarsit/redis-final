@@ -39,6 +39,6 @@ private:
     std::string handleKeys();
     std::string handleClear();
     std::string handleInfo();
-};
+};  
 
 #endif // KV_STORE_H
