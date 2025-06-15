@@ -2,6 +2,7 @@
 #define CLUSTER_MANAGER_H
 
 #include "hash_ring.h"
+#include "cluster_config.h"
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -25,11 +26,16 @@
  * - Failure detection and recovery
  * - Load balancing
  */
+
+// Forward declaration
+class DistributedKVStore;
+
 class ClusterManager {
 private:
     ConsistentHashRing hashRing_; // The consistent-hash ring object
     std::vector<std::shared_ptr<ClusterNode>> nodes_; // All physical nodes in the cluster
     std::recursive_mutex nodesMutex_; // Protects access to `nodes_` and related data
+    std::weak_ptr<DistributedKVStore> kvStore_;
     
     // Health monitoring
     std::thread healthMonitorThread_;
@@ -40,6 +46,10 @@ private:
     std::atomic<size_t> failedRequests_{0};
     std::atomic<size_t> redistributions_{0}; // increments when ring changes
     std::chrono::steady_clock::time_point startTime_;
+
+    // Node cluster
+    std::map<std::string, int> nodeConnections_;  // nodeId -> socket fd
+    std::mutex connectionsMutex_;
 
 public:
     explicit ClusterManager(int virtualNodesPerNode = 150)
@@ -53,7 +63,12 @@ public:
             healthMonitorThread_.join();
         }
     }
-    
+
+    // Add setter for KVStore
+    void setKVStore(std::shared_ptr<DistributedKVStore> store) {
+        kvStore_ = store;
+    }
+
     // Node management (add/remove/get)
     bool addNode(const std::string& nodeId, const std::string& hostname, int port);
     bool removeNode(const std::string& nodeId);
@@ -107,6 +122,22 @@ public:
     };
     
     std::vector<MigrationPlan> planDataMigration(const std::vector<std::string>& allKeys);
+
+    int getNodeConnection(const std::string& nodeId) {
+        std::lock_guard<std::mutex> lock(connectionsMutex_);
+        auto it = nodeConnections_.find(nodeId);
+        return (it != nodeConnections_.end()) ? it->second : -1;
+    }
+
+    void storeNodeConnection(const std::string& nodeId, int sock) {
+        std::lock_guard<std::mutex> lock(connectionsMutex_);
+        nodeConnections_[nodeId] = sock;
+    }
+
+    void removeNodeConnection(const std::string& nodeId) {
+        std::lock_guard<std::mutex> lock(connectionsMutex_);
+        nodeConnections_.erase(nodeId);
+    }
 };
 
 /**

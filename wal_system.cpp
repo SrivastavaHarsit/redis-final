@@ -209,9 +209,27 @@ uint64_t WriteAheadLog::getEntryCount() const {
 // Internal method to write an entry to disk (THREAD-SAFE)
 void WriteAheadLog::writeEntry(const WALEntry& entry) {
     std::lock_guard<std::mutex> lock(wal_mutex);
+    
+    // Check if this is a duplicate entry
+    static uint64_t lastTimestamp = 0;
+    static std::string lastKey;
+    static std::string lastValue;
+    
+    if (entry.timestamp == lastTimestamp && 
+        entry.key == lastKey && 
+        entry.value == lastValue) {
+        return; // Skip duplicate entry
+    }
+    
+    // Update last entry info
+    lastTimestamp = entry.timestamp;
+    lastKey = entry.key;
+    lastValue = entry.value;
+    
+    // Write to WAL
     std::string serialized = entry.serialize();
     wal_file << serialized;
-    wal_file.flush(); // Ensure data reaches disk immediately
+    wal_file.flush();
     entry_count++;
     std::cout << "📝 WAL: " << (entry.type == WALOperationType::PUT ? "PUT" : "DELETE") 
               << " " << entry.key << (entry.type == WALOperationType::PUT ? " = " + entry.value : "") << "\n";

@@ -3,6 +3,7 @@
 // ========================================
 
 #include "hariya_server.h"
+#include "cluster_config.h"
 #include <iostream>
 #include <csignal>
 #include <memory>
@@ -68,6 +69,24 @@ int main(int argc, char* argv[]) {
     if (argc > 2) wal_file = argv[2];
     if (argc > 3) nodeId = argv[3];
     if (argc > 4) hostname = argv[4];
+    // Defer cluster join until after server is constructed
+    std::vector<std::string> cluster_nodes;
+    bool join_cluster = false;
+    std::string boot_host, boot_port;
+    if (argc > 5) {
+        std::string bootstrap = argv[5];  // Format: host:port
+        if (bootstrap != "--standalone") {
+            size_t colon = bootstrap.find(':');
+            if (colon != std::string::npos) {
+                std::string boot_host = bootstrap.substr(0, colon);
+                std::string boot_port = bootstrap.substr(colon + 1);
+                cluster_nodes = { boot_host + ":" + boot_port };
+                join_cluster = true;
+                std::cout << "🔄 Will join cluster via bootstrap node: " 
+                      << boot_host << ":" << boot_port << std::endl;
+            }
+        }
+    }
 
     std::cout << "🐛 DEBUG: Parsed arguments:" << std::endl;
     std::cout << "   port = " << port << std::endl;
@@ -111,11 +130,16 @@ int main(int argc, char* argv[]) {
         std::cout << "🐛 DEBUG: HariyaServer constructor completed \n \n" << std::endl;
         
         // Add debug status before starting
+        // Add debug status before starting
         std::cout << "🐛 DEBUG: Server status before start(): \n \n" << std::endl;
         g_server->debugStatus();
+
+        // Join cluster if requested
+        if (join_cluster) {
+            g_server->joinCluster(cluster_nodes);
+        }
         
         std::cout << "🚀 Starting server on port " << port << "..." << std::endl;
-        std::cout << "🐛 DEBUG: About to call g_server->start()..." << std::endl;
         
         // Start the server (this should bind to port and listen)
         bool startResult = g_server->start();

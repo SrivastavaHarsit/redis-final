@@ -6,13 +6,14 @@
 #include <memory>
 #include <string>
 
-class DistributedKVStore {
+class DistributedKVStore : public std::enable_shared_from_this<DistributedKVStore> {
 private:
     std::unique_ptr<ThreadSafeKVStore> localStore_;  // Local KV store instance
     std::unique_ptr<ClusterManager> clusterManager_; // Manages the hash ring
     std::string nodeId_;                             // Unique ID for this node
     std::string hostname_;                           // Hostname of this node
     int port_;                                       // Port this node listens on
+    ClusterConfig config_;  // Add this
 
 public:
     DistributedKVStore(const std::string& nodeId, 
@@ -31,6 +32,16 @@ public:
     // Utility methods
     void printStats() const;
     void sync();
+    void redistributeKeys(); 
+    void initializeClusterManager();
+    void notifyJoin(const std::string& newNodeId, const std::string& host, int port);
+
+    std::string readWithConsistency(const std::string& key, 
+                                  ClusterConfig::ConsistencyLevel level);
+    
+    std::string writeWithConsistency(const std::string& key,
+                                   const std::string& value,
+                                   ClusterConfig::ConsistencyLevel level);
 
 private:
     // Check if a key belongs to this node

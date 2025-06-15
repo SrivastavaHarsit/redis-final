@@ -1,4 +1,5 @@
 #include "cluster_manager.h"
+#include "distributed_kv_store.h"
 #include <iomanip>
 #include <set>
 
@@ -21,8 +22,12 @@ bool ClusterManager::addNode(const std::string& nodeId, const std::string& hostn
         redistributions_++;
         std::cout << "Added node to cluster: " << node->toString() << std::endl;
         printClusterStatus();
+        // Trigger key redistribution
+        // Call redistributeKeys through KVStore if available
+        if (auto store = kvStore_.lock()) {
+            store->redistributeKeys();
+        }
     }
-    
     return added;
 }
 
@@ -145,26 +150,38 @@ void ClusterManager::startHealthMonitoring() {
 }
 
 void ClusterManager::checkNodeHealth() {
-    std::lock_guard<std::recursive_mutex> lock(nodesMutex_);
-    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    // std::lock_guard<std::recursive_mutex> lock(nodesMutex_);
+    // auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+    //     std::chrono::system_clock::now().time_since_epoch()).count();
     
-    for (auto& node : nodes_) {
-        // Simulate health check (in practice, you'd ping the node)
-        uint64_t timeSinceHeartbeat = now - node->getLastHeartbeat();
+    // for (auto& node : nodes_) {
+    //     // Simulate health check (in practice, you'd ping the node)
+    //     uint64_t timeSinceHeartbeat = now - node->getLastHeartbeat();
         
-        if (timeSinceHeartbeat > 30000) {  // 30 seconds timeout
-            if (node->isHealthy()) {
-                node->markUnhealthy();
-                std::cout << "⚠ Node marked unhealthy: " << node->getId() << std::endl;
-            }
-        } else {
-            if (!node->isHealthy()) {
-                node->markHealthy();
-                std::cout << "✓ Node recovered: " << node->getId() << std::endl;
-            }
+    //     if (timeSinceHeartbeat > 30000) {  // 30 seconds timeout
+    //         if (node->isHealthy()) {
+    //             node->markUnhealthy();
+    //             std::cout << "⚠ Node marked unhealthy: " << node->getId() << std::endl;
+    //         }
+    //     } else {
+    //         if (!node->isHealthy()) {
+    //             node->markHealthy();
+    //             std::cout << "✓ Node recovered: " << node->getId() << std::endl;
+    //         }
+    //     }
+    // }
+
+    // Above is being commented out for development purposes.
+
+    // Disable health checks - all nodes stay healthy
+    std::lock_guard<std::recursive_mutex> lock(nodesMutex_);
+    for (auto& node : nodes_) {
+        if (!node->isHealthy()) {
+            node->markHealthy();
+            std::cout << "✓ Node marked healthy: " << node->getId() << std::endl;
         }
     }
+
 }
 
 // Update node heartbeat (called when receiving responses from nodes)

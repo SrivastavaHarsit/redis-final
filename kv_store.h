@@ -28,6 +28,8 @@ public:
     
     // NEW: Force WAL to flush to disk
     void sync();
+
+    std::vector<std::string> getAllKeys() const;
     
 private:
     // Existing command handlers (mostly unchanged)

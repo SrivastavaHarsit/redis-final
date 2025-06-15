@@ -3,6 +3,7 @@
 // ========================================
 
 #include "hariya_server.h"
+#include "cluster_config.h"
 #include <iostream>
 #include <algorithm>
 #include <cstring>
@@ -30,7 +31,10 @@ HariyaServer::HariyaServer(int p,
     
     try {
         std::cout << "🔄 Creating DistributedKVStore..." << std::endl;
-        distributedStore_ = std::make_unique<DistributedKVStore>(nodeId_, hostname_, port, wal_path);
+         // Use make_shared instead of make_unique
+        distributedStore_ = std::make_shared<DistributedKVStore>(nodeId_, hostname_, port, wal_path);
+        // Initialize after construction is complete
+        distributedStore_->initializeClusterManager();
         std::cout << "✅ DistributedKVStore created successfully" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "❌ Failed to create DistributedKVStore: " << e.what() << std::endl;
@@ -178,6 +182,23 @@ void HariyaServer::run() {
             continue;
         }
 
+        // Check rate limit
+        if (!isConnectionAllowed(clientAddr)) {
+            std::string msg = "ERROR: Too many connections. Please wait.\n";
+            send(clientSocket, msg.c_str(), msg.length(), 0);
+            close(clientSocket);
+            continue;
+        }
+
+        // Set socket timeout - only one declaration
+        struct timeval timeout{30, 0};  // 30 second timeout
+        if (setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+            std::cerr << "Failed to set SO_RCVTIMEO" << std::endl;
+        }
+        if (setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+            std::cerr << "Failed to set SO_SNDTIMEO" << std::endl;
+        }
+
         std::cout << "🎉 New connection accepted from " 
                   << inet_ntoa(clientAddr.sin_addr) << ":" << ntohs(clientAddr.sin_port) 
                   << " (client fd: " << clientSocket << ")" << std::endl;
@@ -218,6 +239,29 @@ int HariyaServer::getActiveConnections() const {
 void HariyaServer::handleClient(int clientSocket) {
     std::cout << "📞 Handling client connection (fd: " << clientSocket << ")" << std::endl;
     
+
+    // Set TCP keepalive with proper values
+    int keepalive = 1;
+    int keepcnt = 3;
+    int keepidle = 30;
+    int keepintvl = 5;
+
+    if (setsockopt(clientSocket, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
+        std::cerr << "Failed to set SO_KEEPALIVE" << std::endl;
+    }
+
+    // Set socket timeout to a longer duration (30 seconds)
+    struct timeval timeout;      
+    timeout.tv_sec = 30;        // 30 second timeout instead of 5
+    timeout.tv_usec = 0;
+    
+    if (setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        std::cerr << "Failed to set SO_RCVTIMEO" << std::endl;
+    }
+    if (setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        std::cerr << "Failed to set SO_SNDTIMEO" << std::endl;
+    }
+
     connectionManager.newConnection();
     int connectionId = connectionManager.getActiveConnections();
 
@@ -343,8 +387,29 @@ void HariyaServer::debugStatus() {
 
 void HariyaServer::joinCluster(const std::vector<std::string>& seedNodes) {
     if (distributedStore_) {
-        distributedStore_->joinCluster(seedNodes);
+        // First join the cluster
+        if (distributedStore_->joinCluster(seedNodes)) {
+            std::cout << "✅ Successfully joined cluster" << std::endl;
+            
+            // Now notify all seed nodes about our presence
+            for (const auto& node : seedNodes) {
+                size_t colon = node.find(':');
+                if (colon != std::string::npos) {
+                    std::string host = node.substr(0, colon);
+                    int port = std::stoi(node.substr(colon + 1));
+                    
+                    // TODO: Open socket connection to host:port
+                    // Send CLUSTER JOIN nodeId_ hostname_ port
+                    std::cout << "🔄 Notifying " << host << ":" << port 
+                             << " about our presence" << std::endl;
+                }
+            }
+        }
     }
+    else {
+        std::cerr << "❌ Distributed store not initialized, cannot join cluster" << std::endl;
+    }
+    std::cout << "🔄 Cluster join process completed" << std::endl;
 }
 
 void HariyaServer::addClusterNode(const std::string& nodeId, const std::string& host, int port) {
@@ -361,4 +426,26 @@ void HariyaServer::removeClusterNode(const std::string& nodeId) {
 
 std::string HariyaServer::generateNodeId() {
     return hostname_ + "_" + std::to_string(port) + "_" + std::to_string(time(nullptr));
+}
+
+
+bool HariyaServer::isConnectionAllowed(const struct sockaddr_in& clientAddr) {
+    std::string clientIP = inet_ntoa(clientAddr.sin_addr);
+    std::lock_guard<std::mutex> lock(rateLimitMutex_);
+    
+    time_t now = time(nullptr);
+    auto& rateInfo = connectionRates_[clientIP];
+    
+    if (now - rateInfo.first >= RATE_LIMIT_WINDOW) {
+        rateInfo.first = now;
+        rateInfo.second = 0;
+    }
+    
+    if (rateInfo.second >= MAX_CONNECTIONS_PER_IP) {
+        std::cout << "⚠️ Rate limit exceeded for IP " << clientIP << std::endl;
+        return false;
+    }
+    
+    rateInfo.second++;
+    return true;
 }

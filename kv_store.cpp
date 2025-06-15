@@ -269,3 +269,15 @@ void ThreadSafeKVStore::sync() {
     wal.flush();
     std::cout << "💾 WAL synced to disk" << std::endl;
 }
+
+std::vector<std::string> ThreadSafeKVStore::getAllKeys() const {
+    std::lock_guard<std::mutex> lock(storeMutex);
+    std::vector<std::string> keys;
+    keys.reserve(store.size());
+    
+    for (const auto& pair : store) {
+        keys.push_back(pair.first);
+    }
+    
+    return keys;
+}
