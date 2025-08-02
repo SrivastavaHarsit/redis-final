@@ -8,11 +8,29 @@
 #include <filesystem>
 #include <vector>
 
-// WALEntry Constructor
+/// Constructor for a Write-Ahead Log (WAL) entry.
+// Each entry represents a single operation (PUT, DELETE, REPLICATION, etc.) in the WAL system.
+// This constructor initializes all fields needed to describe the operation and its context.
 WALEntry::WALEntry(WALOperationType op_type, const std::string& k, const std::string& v,
                    const std::string& node_id, const std::string& target_node)
-    : type(op_type), key(k), value(v), timestamp(getCurrentTimestamp()),
-      nodeId(node_id), targetNodeId(target_node), clusterVersion(0), isReplicated(false) {}
+    // Set the type of operation (e.g., PUT, DELETE, REPLICATION, CLUSTER_JOIN, etc.)
+    : type(op_type)
+    // The key involved in the operation (could be empty for some cluster ops)
+    , key(k)
+    // The value associated with the key (empty for DELETE or some cluster ops)
+    , value(v)
+    // Record the current timestamp (in microseconds) when the entry is created.
+    // This is used for ordering and recovery.
+    , timestamp(getCurrentTimestamp())
+    // The ID of the node performing this operation (for auditing and replication)
+    , nodeId(node_id)
+    // The target node for replication/migration (empty if not applicable)
+    , targetNodeId(target_node)
+    // The cluster version at the time of this operation (set to 0 by default, can be updated later)
+    , clusterVersion(0)
+    // Indicates if this entry is a result of replication (false by default)
+    , isReplicated(false)
+{}
 
 // Get current timestamp in microseconds
 uint64_t WALEntry::getCurrentTimestamp() {
@@ -20,7 +38,12 @@ uint64_t WALEntry::getCurrentTimestamp() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+
 // Convert WALEntry to string format for disk storage
+// Serializes the WALEntry object into a single string for storage in the WAL file.
+// The format is a pipe-separated list of fields: operation type, timestamp, node IDs, cluster version,
+// replication flag, key length and value, and value length and value. This allows for efficient parsing
+// and recovery of WAL entries during replay or replication.
 std::string WALEntry::serialize() const {
     std::ostringstream oss;
     oss << static_cast<int>(type) << "|"
@@ -34,7 +57,34 @@ std::string WALEntry::serialize() const {
     return oss.str();
 }
 
+
 // Convert string back to WALEntry
+/*
+ * Deserializes a string from the WAL file back into a WALEntry object.
+ *
+ * Flow:
+ * 1. Checks if the input line is empty. If so, returns std::nullopt (no entry).
+ * 2. Creates a string stream to parse the line, splitting fields by the '|' delimiter.
+ * 3. Parses each field in order:
+ *    a. Operation type (as integer, then cast to WALOperationType).
+ *    b. Timestamp (when the operation occurred).
+ *    c. nodeId (the node that performed the operation).
+ *    d. targetNodeId (the target node for replication/migration, if any).
+ *    e. clusterVersion (the cluster state version at the time).
+ *    f. isReplicated (flag: "1" for true, "0" for false).
+ *    g. key length (ensures correct parsing of the key).
+ *    h. key (the actual key string, must match the specified length).
+ *    i. value length (ensures correct parsing of the value).
+ *    j. value (the actual value string, must match the specified length; may be empty).
+ * 4. If any field is missing, malformed, or does not match the expected length, returns std::nullopt.
+ * 5. Constructs a WALEntry object using the parsed fields.
+ * 6. Sets additional fields (timestamp, clusterVersion, isReplicated) on the entry.
+ * 7. Returns the reconstructed WALEntry object.
+ * 8. If any exception occurs during parsing, logs the error and returns std::nullopt.
+ *
+ * This function is used during WAL replay and recovery to reconstruct the sequence of operations
+ * that occurred in the system, ensuring data durability and consistency after crashes or restarts.
+ */
 std::optional<WALEntry> WALEntry::deserialize(const std::string& line) {
     if (line.empty()) return std::nullopt;
     
@@ -96,9 +146,24 @@ std::optional<WALEntry> WALEntry::deserialize(const std::string& line) {
     }
 }
 
+
+
 // WAL Constructor
 WriteAheadLog::WriteAheadLog(const std::string& file_path, const std::string& node_id) 
     : wal_file_path(file_path), entry_count(0), nodeId_(node_id), clusterVersion_(0) {
+
+    //Create parent directories if needed:
+    // std::filesystem::path path(file_path);
+    // // if (path.has_parent_path()) {   std::filesystem::create_directories(path.parent_path()); }
+    // // This ensures that the directory for the WAL file exists. If     it doesn’t, it creates all necessary parent directories.
+
+    // Open the WAL file for appending:
+    // wal_file.open(wal_file_path, std::ios::app);
+    // // Opens the WAL file in append mode, so new entries are added     to the end of the file.
+
+    // Check if the file opened successfully:
+    // if (!wal_file.is_open()) { throw std::runtime_error("Failed to open WAL file: " + wal_file_path); }
+    // If the file cannot be opened, it throws a runtime error, stopping the program and reporting the problem.
     std::filesystem::path path(file_path);
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path());
@@ -207,6 +272,22 @@ uint64_t WriteAheadLog::getEntryCount() const {
 }
 
 // Internal method to write an entry to disk (THREAD-SAFE)
+/*
+ * Writes a WALEntry to the Write-Ahead Log (WAL) file in a thread-safe manner.
+ *
+ * Flow:
+ * 1. Acquires a lock to ensure only one thread writes to the WAL at a time.
+ * 2. Checks if the entry is a duplicate of the last written entry (by comparing timestamp, key, and value).
+ *    - If it is a duplicate, skips writing to avoid redundant log entries.
+ * 3. Updates the static variables to remember the last written entry's timestamp, key, and value.
+ * 4. Serializes the WALEntry to a string format suitable for disk storage.
+ * 5. Writes the serialized entry to the WAL file and flushes the file to ensure durability.
+ * 6. Increments the entry count for statistics.
+ * 7. Prints a log message to the console indicating the operation (PUT or DELETE) and the key/value.
+ *
+ * This function ensures that all WAL writes are atomic, avoids duplicate entries,
+ * and guarantees that every operation is safely persisted for recovery.
+ */
 void WriteAheadLog::writeEntry(const WALEntry& entry) {
     std::lock_guard<std::mutex> lock(wal_mutex);
     
@@ -242,6 +323,7 @@ WALEntry WriteAheadLog::createEntry(WALOperationType type, const std::string& ke
     entry.clusterVersion = clusterVersion_;
     return entry;
 }
+
 
 // Cluster-aware methods
 void WriteAheadLog::logReplication(const std::string& key, const std::string& value, 

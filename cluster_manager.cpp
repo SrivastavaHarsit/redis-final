@@ -1,33 +1,58 @@
 #include "cluster_manager.h"
+#include "cluster_config.h"
 #include "distributed_kv_store.h"
 #include <iomanip>
 #include <set>
 
-// Node management
+/*
+ * Adds a new node to the cluster.
+ *
+ * Flow:
+ * 1. Acquires a recursive lock to ensure thread-safe access to the cluster's node list.
+ * 2. Checks if a node with the same nodeId already exists in the cluster.
+ *    - If it exists, returns false (no duplicate nodes allowed).
+ * 3. Creates a new ClusterNode object for the given nodeId, hostname, and port.
+ * 4. Adds the new node to the cluster's node list.
+ * 5. Adds the node to the consistent hash ring for key distribution.
+ * 6. If the node was successfully added to the hash ring:
+ *    a. Increments the redistributions counter (tracks ring changes).
+ *    b. Prints a message and the updated cluster status.
+ *    c. If a KV store is attached, triggers key redistribution so data is balanced across the new cluster.
+ * 7. Returns true if the node was added, false otherwise.
+ *
+ * This function ensures that new nodes are safely integrated into the cluster,
+ * the hash ring is updated, and data is redistributed for balanced load and fault tolerance.
+ */
 bool ClusterManager::addNode(const std::string& nodeId, const std::string& hostname, int port) {
+    // Lock the nodesMutex_ to prevent other threads from modifying the node list at the same time.
     std::lock_guard<std::recursive_mutex> lock(nodesMutex_);
     
-    // Check if node already exists
+    // Loop through all existing nodes to check if a node with the same ID already exists.
     for (const auto& node : nodes_) {
         if (node->getId() == nodeId) {
+            // If found, do not add a duplicate. Return false.
             return false;  // Node already exists
         }
     }
     
+    // Create a new ClusterNode object (shared_ptr for memory safety and sharing).
     auto node = std::make_shared<ClusterNode>(nodeId, hostname, port);
+    // Add the new node to the nodes_ vector (the cluster's list of nodes).
     nodes_.push_back(node);
     
+    // Add the node to the consistent hash ring for key distribution.
     bool added = hashRing_.addNode(node);
     if (added) {
-        redistributions_++;
+        // If the node was successfully added to the ring:
+        redistributions_++; // Increment the count of redistributions (for stats/monitoring).
         std::cout << "Added node to cluster: " << node->toString() << std::endl;
-        printClusterStatus();
-        // Trigger key redistribution
-        // Call redistributeKeys through KVStore if available
+        printClusterStatus(); // Print the updated cluster status to the console.
+        // If a key-value store is attached, trigger key redistribution.
         if (auto store = kvStore_.lock()) {
-            store->redistributeKeys();
+            store->redistributeKeys(); // Move keys to their new correct nodes.
         }
     }
+    // Return true if the node was added to the ring, false otherwise.
     return added;
 }
 
@@ -67,19 +92,25 @@ std::vector<std::shared_ptr<ClusterNode>> ClusterManager::getReplicaNodes(const 
     return hashRing_.getNodes(key, replicationFactor);
 }
 
+/*
+ Not used only for demo this file standalone
+ */
 ClusterManager::OperationResult ClusterManager::routeGet(const std::string& key) {
     OperationResult result;
+    // Find the primary node responsible for this key using the hash ring.
     result.targetNode = getNodeForKey(key);
     
+    // If no node is available (e.g., cluster is empty), return an error.
     if (!result.targetNode) {
         result.errorMessage = "No available nodes";
         failedRequests_++;
         return result;
     }
     
+    // If the chosen node is unhealthy, try to find a healthy replica.
     if (!result.targetNode->isHealthy()) {
-        // Try to find a healthy replica
-        auto replicas = getReplicaNodes(key, 3);
+        // Get all replicas for this key using the default replication factor (e.g., 2).
+        auto replicas = getReplicaNodes(key, 2);
         for (auto replica : replicas) {
             if (replica->isHealthy()) {
                 result.targetNode = replica;
@@ -87,6 +118,7 @@ ClusterManager::OperationResult ClusterManager::routeGet(const std::string& key)
             }
         }
         
+        // If no healthy replica is found, return an error.
         if (!result.targetNode || !result.targetNode->isHealthy()) {
             result.errorMessage = "No healthy nodes available for key";
             failedRequests_++;
@@ -94,8 +126,8 @@ ClusterManager::OperationResult ClusterManager::routeGet(const std::string& key)
         }
     }
     
-    // Here you would make the actual network call to the node
-    // For now, simulate the operation
+    // (In a real system, here you would send the GET request over the network.)
+    // For now, just simulate a successful operation.
     result.success = true;
     result.response = "GET operation routed to " + result.targetNode->getId();
     
@@ -149,6 +181,7 @@ void ClusterManager::startHealthMonitoring() {
     });
 }
 
+// Currently, this function is disabled for development purposes.
 void ClusterManager::checkNodeHealth() {
     // std::lock_guard<std::recursive_mutex> lock(nodesMutex_);
     // auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -184,16 +217,34 @@ void ClusterManager::checkNodeHealth() {
 
 }
 
-// Update node heartbeat (called when receiving responses from nodes)
+
+/*
+ * Updates the heartbeat timestamp for a specific node in the cluster.
+ *
+ * Flow:
+ * 1. Acquires a recursive lock to ensure thread-safe access to the cluster's node list.
+ * 2. Gets the current time in milliseconds since the epoch.
+ * 3. Loops through all nodes in the cluster to find the node with the given nodeId.
+ * 4. If the node is found, updates its last heartbeat timestamp to the current time.
+ * 5. Exits the loop after updating the node.
+ *
+ * This function is typically called whenever a node sends a response or heartbeat,
+ * helping the cluster manager track which nodes are alive and responsive.
+ */
 void ClusterManager::updateNodeHeartbeat(const std::string& nodeId) {
+    // Lock the nodesMutex_ to prevent other threads from modifying the node list at the same time.
     std::lock_guard<std::recursive_mutex> lock(nodesMutex_);
+    
+    // Get the current time in milliseconds since the epoch.
     auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     
+    // Loop through all nodes to find the one with the matching nodeId.
     for (auto& node : nodes_) {
         if (node->getId() == nodeId) {
+            // Update the node's last heartbeat timestamp.
             node->updateHeartbeat(now);
-            break;
+            break; // Stop searching after updating the correct node.
         }
     }
 }
@@ -285,9 +336,23 @@ ClusterManager::ClusterStats ClusterManager::getClusterStats() {
     return stats;
 }
 
-// Simulate data migration (for when nodes are added/removed)
+/*
+ * Plans data migration between nodes when the cluster changes (e.g., nodes are added or removed).
+ *
+ * Flow:
+ * 1. Initializes an empty list of migration plans.
+ * 2. (In a real system) Would compare the current key-to-node mapping with the desired mapping after a ring change,
+ *    identify which keys need to move, group them by source and target nodes, estimate data sizes, and prioritize migrations.
+ * 3. For demonstration, builds a map of which node currently owns which keys.
+ * 4. Prints the current key distribution across nodes.
+ * 5. (Demo only) If there are at least two nodes, creates a sample migration plan to move a sample key from the first node to the second.
+ * 6. Returns the list of migration plans.
+ *
+ * This function helps visualize and plan how data would be moved to keep the cluster balanced and consistent
+ * after topology changes, but the current implementation is only a simplified demo.
+ */
 std::vector<ClusterManager::MigrationPlan> ClusterManager::planDataMigration(const std::vector<std::string>& allKeys) {
-    std::vector<MigrationPlan> plans;
+    std::vector<MigrationPlan> plans; // List to hold migration plans
     
     // This is a simplified version - in practice, we need to:
     // 1. Compare current key->node mapping with desired mapping
@@ -298,40 +363,40 @@ std::vector<ClusterManager::MigrationPlan> ClusterManager::planDataMigration(con
     
     std::cout << "Planning data migration for " << allKeys.size() << " keys..." << std::endl;
     
-    // For demonstration, just showing which nodes would handle which keys
+    // Build a map of nodeId -> list of keys currently owned by that node
     std::map<std::string, std::vector<std::string>> nodeKeyMap;
-    
     for (const auto& key : allKeys) {
-        auto node = getNodeForKey(key);
+        auto node = getNodeForKey(key); // Find which node currently owns this key
         if (node) {
             nodeKeyMap[node->getId()].push_back(key);
         }
     }
     
+    // Print out the current key distribution for visibility
     std::cout << "Current key distribution:" << std::endl;
     for (const auto& pair : nodeKeyMap) {
         std::cout << "  " << pair.first << ": " << pair.second.size() << " keys" << std::endl;
     }
     
-    // 2. (In a full system, we’d also get the “desired” mapping after ring changes 
-    //    and compare old vs. new. Then compute exactly which keys to move from A→B.)
-    //    For this demo, we just show a toy example: pick the first two nodes and say 
-    //    we’ll migrate “some keys” from node 0 to node 1.
-
-
-    // Create a sample migration plan for demonstration
+    // In a real system, here you would:
+    // - Get the new mapping after a ring change
+    // - Compare old and new mappings
+    // - Figure out which keys need to move from which node to which node
+    // - Create migration plans for those keys
+    
+    // For this demo, just create a sample migration plan if there are at least two nodes
     if (nodeKeyMap.size() >= 2) {
         MigrationPlan plan;
         auto it = nodeKeyMap.begin();
-        plan.sourceNodeId = it->first;
+        plan.sourceNodeId = it->first; // First node
         ++it;
-        plan.targetNodeId = it->first;
-        plan.loadDifference = 15.0; // Sample load difference
-        plan.keysToMigrate.push_back("sample_key_migration");
+        plan.targetNodeId = it->first; // Second node
+        plan.loadDifference = 15.0; // Sample load difference (not calculated)
+        plan.keysToMigrate.push_back("sample_key_migration"); // Just a placeholder key
         plans.push_back(plan);
     }
     
-    return plans;
+    return plans; // Return the list of migration plans (real or demo)
 }
 
 

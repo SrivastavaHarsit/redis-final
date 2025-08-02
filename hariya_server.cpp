@@ -32,6 +32,7 @@ HariyaServer::HariyaServer(int p,
     try {
         std::cout << "🔄 Creating DistributedKVStore..." << std::endl;
          // Use make_shared instead of make_unique
+         // pandey
         distributedStore_ = std::make_shared<DistributedKVStore>(nodeId_, hostname_, port, wal_path);
         // Initialize after construction is complete
         distributedStore_->initializeClusterManager();
@@ -55,6 +56,17 @@ HariyaServer::~HariyaServer() {
     std::cout << "✅ WAL flush complete" << std::endl;
 }
 
+
+// Starts the HariyaServer by creating, configuring, and binding a TCP socket.
+// Steps:
+// 1. Checks if the server is already running.
+// 2. Creates a server socket for incoming TCP connections.
+// 3. Sets socket options (SO_REUSEADDR) for easier restarts.
+// 4. Prepares the address structure to listen on the specified port and all interfaces.
+// 5. Binds the socket to the address and port.
+// 6. Starts listening for incoming connections (backlog 10).
+// 7. Verifies the socket status and sets the running flag to true.
+// If any step fails, prints an error and returns false. On success, the server is ready to accept client connections.
 bool HariyaServer::start() {
     std::cout << "🚀 HariyaServer::start() called" << std::endl;
     
@@ -144,6 +156,8 @@ bool HariyaServer::start() {
     return true;
 }
 
+
+
 void HariyaServer::run() {
     std::cout << "🏃 HariyaServer::run() called" << std::endl;
     
@@ -164,6 +178,13 @@ void HariyaServer::run() {
         socklen_t clientLen = sizeof(clientAddr);
 
         std::cout << "🔄 Calling accept() on socket " << serverSocket << "..." << std::endl;
+        // A TCP SYN arrives and the three‑way handshake completes.
+
+        // The OS creates a new socket (new FD clientSocket) bound to the same local IP+port but dedicated to this one client.
+
+        // The client’s IP+port are filled into clientAddr, and clientLen captures its size.
+
+
         int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
         
         if (clientSocket < 0) {

@@ -89,6 +89,32 @@ bool DistributedKVStore::isLocalKey(const std::string& key) {
     return targetNode && targetNode->getId() == nodeId_;
 }
 
+
+
+
+/*
+ * Routes a key-value operation to the correct node in the cluster.
+ * 
+ * Flow:
+ * 1. Checks if the key belongs to the local node using isLocalKey(key).
+ *    - If yes: Builds the command string and processes it locally using localStore_->processCommand().
+ *    - If no:  Proceeds to route the command to the correct remote node.
+ * 
+ * 2. For remote keys:
+ *    a. Uses clusterManager_->getNodeForKey(key) to find the responsible node.
+ *       - If no node is available, returns an error.
+ *    b. Tries to get an existing TCP connection to the target node from the cluster manager.
+ *       - If no connection exists, creates a new socket and connects to the target node.
+ *       - If connection fails, returns an error.
+ *       - If connection succeeds, stores the new connection in the cluster manager.
+ *    c. Builds the full command string (including value if present) and sends it over the socket.
+ *    d. Waits for a response from the remote node (using recv).
+ *    e. If a new connection was created for this operation, closes the socket after use.
+ *    f. Returns the response from the remote node.
+ * 
+ * This function ensures that every operation is executed on the correct node in the cluster,
+ * either locally or by routing it over the network, and handles connection management for efficiency.
+ */
 std::string DistributedKVStore::routeOperation(const std::string& command, 
                                                const std::string& key, 
                                                const std::string& value) {
@@ -164,10 +190,41 @@ std::string DistributedKVStore::routeOperation(const std::string& command,
     }
 }
 
+
+
+// Handles operations that do not require routing, such as local commands
 std::string DistributedKVStore::handleLocalOperation(const std::string& command) {
     return localStore_->processCommand(command);
 }
 
+
+
+
+
+/*
+ * Handles cluster management commands sent to the distributed key-value store.
+ * 
+ * Flow:
+ * 1. Parses the command to extract the cluster subcommand (e.g., INFO, JOIN, LEAVE, etc.).
+ * 2. Converts the subcommand to uppercase for case-insensitive matching.
+ * 3. Executes the appropriate action based on the subcommand:
+ *    - INFO:      Returns cluster statistics (node count, health, requests, etc.).
+ *    - JOIN:      Adds a new node to the cluster (expects nodeId, hostname, port).
+ *    - LEAVE:     Removes a node from the cluster (expects nodeId).
+ *    - REDISTRIBUTE: Triggers redistribution of keys across the cluster.
+ *    - STATS:     Prints detailed cluster and storage statistics.
+ *    - SYNC:      Forces a sync of the local store (e.g., flushes WAL to disk).
+ *    - ADD:       Adds a node to the cluster (same as JOIN, expects nodeId, hostname, port).
+ *    - REMOVE:    Removes a node from the cluster (expects nodeId).
+ *    - NODES:     (Not implemented) Intended to list all nodes in the cluster.
+ *    - HEARTBEAT: Updates the heartbeat timestamp for a node (expects nodeId).
+ *    - Unknown:   Returns an error for unrecognized subcommands.
+ * 4. For each command, validates the required arguments and returns an error if missing.
+ * 5. Returns a response string indicating the result of the operation.
+ * 
+ * This function allows nodes and clients to manage cluster membership, monitor health,
+ * trigger key redistribution, and perform other cluster-wide operations.
+ */
 std::string DistributedKVStore::handleClusterCommand(const std::string& command) {
     std::istringstream iss(command);
     std::string cluster, subcommand;
@@ -256,7 +313,30 @@ std::string DistributedKVStore::handleClusterCommand(const std::string& command)
     }
 }
 
+
+
 // Hardcoded joinCluster method
+/*
+ * Attempts to join an existing cluster using a list of seed nodes.
+ * 
+ * Flow:
+ * 1. Iterates over each seed node (given as "host:port"):
+ *    a. Splits the string to extract the host and port.
+ *    b. Creates a TCP socket for connecting to the seed node.
+ *    c. Tries to connect to the seed node using the socket.
+ *       - If connection fails, logs an error and tries the next seed node.
+ *    d. If connection succeeds:
+ *       - Adds the seed node to the local cluster manager.
+ *       - Sends a "CLUSTER JOIN" command to the seed node, announcing this node's presence.
+ *       - Reads and prints the response from the seed node.
+ *       - Stores the socket for persistent communication with the seed node.
+ *       - Starts a background thread to send periodic "CLUSTER HEARTBEAT" messages to the seed node and monitor the connection.
+ * 2. If at least one seed node was successfully joined, triggers key redistribution to balance data across the cluster.
+ * 3. Returns true if joined to any seed node, false otherwise.
+ * 
+ * This function allows a new node to join an existing distributed cluster, establish persistent connections,
+ * announce itself to other nodes, and participate in cluster-wide data management.
+ */
 bool DistributedKVStore::joinCluster(const std::vector<std::string>& seedNodes) {
     std::cout << "🤝 Joining cluster with " << seedNodes.size() << " seed nodes\n";
     bool joinedAny = false;
@@ -334,6 +414,8 @@ bool DistributedKVStore::joinCluster(const std::vector<std::string>& seedNodes) 
     return joinedAny;
 }
 
+
+// Adds a new node to the cluster and updates the cluster manager   
 void DistributedKVStore::addNode(const std::string& nodeId, const std::string& host, int port) {
     clusterManager_->addNode(nodeId, host, port);
     std::cout << "➕ Added node: " << nodeId << "@" << host << ":" << port << std::endl;
@@ -355,6 +437,28 @@ void DistributedKVStore::sync() {
     localStore_->sync();
 }
 
+
+
+/*
+ * Redistributes all keys managed by the local node to their correct replica nodes in the cluster.
+ * 
+ * Flow:
+ * 1. Retrieves all keys currently stored on the local node.
+ * 2. For each key:
+ *    a. Uses the cluster manager to determine which nodes should hold replicas of this key (based on the replication factor).
+ *    b. Skips the key if no replica nodes are found.
+ *    c. Gets the value for the key from the local store.
+ *    d. Skips the key if the value is missing or nil.
+ *    e. For each replica node (excluding self):
+ *       i.   Creates a TCP connection to the replica node.
+ *       ii.  Sends a SET command with the key and value to the replica node.
+ *       iii. Waits for a response to confirm replication.
+ *       iv.  Logs the replication and closes the connection.
+ * 3. After all keys are processed, prints the total number of successful replications.
+ * 
+ * This function ensures that, after cluster membership changes (like node join/leave),
+ * all keys are correctly replicated to the appropriate nodes, maintaining data consistency and redundancy.
+ */
 void DistributedKVStore::redistributeKeys() {
    std::cout << "🔄 Starting key redistribution..." << std::endl;
     
@@ -408,6 +512,7 @@ void DistributedKVStore::redistributeKeys() {
     std::cout << "✅ Replication complete. Created " << replicated << " replicas" << std::endl;
 }
 
+
 void DistributedKVStore::notifyJoin(const std::string& newNodeId, const std::string& host, int port) {
     // Add new node to cluster
     addNode(newNodeId, host, port);
@@ -416,6 +521,30 @@ void DistributedKVStore::notifyJoin(const std::string& newNodeId, const std::str
     redistributeKeys();
 }
 
+
+/*
+ * Reads a key from the distributed key-value store with the specified consistency level.
+ * 
+ * Flow:
+ * 1. Checks if the key is managed by the local node using isLocalKey(key).
+ *    - If yes: Reads and returns the value directly from the local store.
+ * 2. If not local, retrieves the list of replica nodes for the key from the cluster manager.
+ *    - If no replica nodes are found, returns (nil).
+ * 3. Attempts to read the value from the primary replica node (first in the list):
+ *    a. Tries to reuse an existing TCP connection to the primary node, or creates a new one if needed.
+ *    b. Sends a GET command for the key to the primary node.
+ *    c. Receives the value and adds it to the results.
+ *    d. Closes the connection if it was newly created.
+ * 4. Determines how many responses are required based on the requested consistency level:
+ *    - ONE:    Only one successful response is needed.
+ *    - QUORUM: A majority of replicas must respond.
+ *    - ALL:    All replicas must respond.
+ * 5. If the number of responses is less than required, returns an error.
+ * 6. Returns the value if enough responses were received, or (nil) if not found.
+ * 
+ * This function ensures that read operations respect the desired consistency guarantees
+ * (ONE, QUORUM, or ALL) by contacting the appropriate number of replica nodes.
+ */
 std::string DistributedKVStore::readWithConsistency(
     const std::string& key, 
     ClusterConfig::ConsistencyLevel level) {
@@ -432,14 +561,24 @@ std::string DistributedKVStore::readWithConsistency(
         return "(nil)\n";
     }
 
+
     std::vector<std::string> values;
     int responses = 0;
 
     // Try primary node first (first replica)
+    // Picks the primary node (first in the replica list).
+    // Tries to reuse an existing TCP connection to the primary node (for efficiency).
+    // If no connection exists, will create a new one.
     auto primaryNode = replicaNodes[0];
     int sock = clusterManager_->getNodeConnection(primaryNode->getId());
     bool newConnection = false;
 
+    // If no existing connection, create a new one
+    //Creates a new TCP socket.
+    //Sets up the address for the primary node.
+    //Tries to connect to the primary node.
+    //If connection fails, returns an error.
+    //If successful, stores the connection for future use and marks it as new.
     if (sock == -1) {
         sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
@@ -503,6 +642,30 @@ std::string DistributedKVStore::readWithConsistency(
 }
 
 
+
+/*
+ * Writes a key-value pair to the distributed key-value store with the specified consistency level.
+ * 
+ * Flow:
+ * 1. Checks if the key is managed by the local node using isLocalKey(key).
+ *    - If yes: Writes the value locally and increments successfulWrites.
+ * 2. If not local, retrieves the list of replica nodes for the key from the cluster manager.
+ *    - If no replica nodes are found, returns an error.
+ * 3. Attempts to write the value to each replica node:
+ *    a. Creates a TCP connection to each replica node (skipping self).
+ *    b. Sends a SET command with the key and value to the replica node.
+ *    c. Receives and checks the response for success.
+ *    d. Increments successfulWrites for each successful write.
+ * 4. Determines how many successful writes are required based on the requested consistency level:
+ *    - ONE:    At least one successful write is required.
+ *    - QUORUM: A majority of replicas must respond successfully.
+ *    - ALL:    All replicas must respond successfully.
+ * 5. If the number of successful writes is less than required, returns an error.
+ * 6. Returns "OK" if enough successful writes were achieved, or an error message otherwise.
+ * 
+ * This function ensures that write operations respect the desired consistency guarantees
+ * (ONE, QUORUM, or ALL) by contacting the appropriate number of replica nodes and waiting for their responses.
+ */
 std::string DistributedKVStore::writeWithConsistency(
     const std::string& key,
     const std::string& value,
